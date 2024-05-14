@@ -1,0 +1,110 @@
+var region1 = ee.FeatureCollection('projects/ee-evanomondi/assets/Baringo_South');
+var start = '2019-01-01'
+var end = '2019-03-01'
+var region = Map.getBounds(true)
+
+var filter = ee.Filter.and(
+  ee.Filter.date(start, end),
+  ee.Filter.bounds(region1)
+)
+
+var l8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+  .filter(filter)
+  .map(function (image) {
+    var qa = image.select('pixel_qa')
+    image = image.select(
+      ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'],
+      ['aerosol', 'blue', 'green', 'red', 'nir', 'swir1', 'swir2']
+    )
+    return image.clip(region1)
+      .updateMask(
+        qa.bitwiseAnd(2).or(qa.bitwiseAnd(4)) // Clear or water
+          .and(cloudScore(image).lt(0.25))
+      )
+      .int16() // Same data type
+      .resample('bilinear')
+  })
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filter(filter)
+  .map(function (image) {
+    var qa = image.select('QA60')
+    image = image.select(
+      ['B1', 'B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+      ['aerosol', 'blue', 'green', 'red', 'nir', 'swir1', 'swir2']  
+    )
+    return image.clip(region1)
+      .updateMask(
+        qa.not()
+          .and(cloudScore(image).lt(0.25))
+      )
+      .resample('bilinear')
+      .int16() // Same data type
+  })
+
+//var fusion = l8.merge(s2)
+var fusion = l8.merge(s2)
+
+// Check the spatial resolution of the resulting image
+var spatialResolution = fusion.first().projection().nominalScale()
+print('Spatial resolution of the resulting image:', spatialResolution)
+
+
+
+
+
+
+
+
+var visParams = {bands: 'red,green,blue', min: 0, max: 3000}
+Map.addLayer(l8.median(), visParams, 'L8')
+Map.addLayer(s2.median(), visParams, 'S2')
+Map.addLayer(fusion.median(), visParams, 'fusion')
+
+// Based on scripts by Ian Hausman, which in turn is based on script by Matt Hancher
+// https://groups.google.com/d/msg/google-earth-engine-developers/i63DS-Dg8Sg/_hgCBEYeBwAJ
+function cloudScore(image) {
+    image = image.divide(10000).float()
+    var score = ee.Image(1)
+    var blueCirrusScore = ee.Image(0)
+
+    // Clouds are reasonably bright in the blue or cirrus bands.
+    // Use .max as a pseudo OR conditional
+    blueCirrusScore = blueCirrusScore.max(unitScale(image.select('blue'), 0.1, 0.5))
+    blueCirrusScore = blueCirrusScore.max(unitScale(image.select('aerosol'), 0.1, 0.5))
+    // blueCirrusScore = blueCirrusScore.max(unitScale(image.select('aerosol'), 0.1, 0.3)) // Sentinel 2 SR doesn't have cirrus
+    score = score.min(blueCirrusScore)
+
+    // Clouds are reasonably bright in all visible bands.
+    score = score.min(
+        unitScale(image.expression('i.red + i.green + i.blue', {i: image}),0.2, 0.8)
+    )
+
+    // Clouds are reasonably bright in all infrared bands.
+    score = score.min(
+        unitScale(image.expression('i.nir + i.swir1 + i.swir2', {i: image}), 0.3, 0.8)
+    )
+
+    // However, clouds are not snow.
+    var ndsi = image.normalizedDifference(['green', 'swir1'])
+    score = score.min(
+        unitScale(ndsi, 0.8, 0.6)
+    )
+
+    return score
+}
+
+function unitScale(image, low, high) {
+    return image
+        .subtract(low)
+        .divide(ee.Number(high).subtract(ee.Number(low)))
+        .clamp(0, 1)
+}
+
+Export.image.toDrive({
+image: fusion,
+description: 's2l8',
+scale: 10,
+region: region1,
+maxPixels: 3E10
+});
